@@ -1,0 +1,854 @@
+---
+title: "austin_cpa_corpo_filings"
+output: html_document
+date: "2025-01-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+```{r}
+library(readr)
+library(rvest)
+library(selenider)
+library(dplyr)
+library(selenium)
+library(readr)
+library(future)
+library(foreach)
+library(tabulapdf)
+library(magick)
+library(httr)
+library(httr2)
+
+```
+
+```{r}
+
+overpass_query <- '[out:json][timeout:720];area[name~"United States|^U(\\.)?S(\\.)?(A)?(\\.*)?",i];nwr(area)[~"name|brand|operator"~"amazon",i]["name"!~"fresh|shop|market|locker|park|hub|lot|airport|highway|bus|casino|road|ave|delivery|drive|street|boule|freeway|turnpike|gate|court",i][!"highway"][!"waterway"][!"tourism"][!"parcel_pickup"][!"parcel_mail_in"][!"attraction"][!"shop"][!"club"][!"store"][!"resource"][!"residential"][!"cuisine"][!"natural"][!"leisure"][!"crossing"][!"public_transport"][!"railway"][!"bus"];(._;>;>>;);out meta;'
+
+# overpass_query <- '[out:json];node(around:1000,40.1296821,-75.4866286)["name"];out meta;'
+
+overpass_url_passed <- utils::URLencode(sprintf('https://overpass-api.de/api/interpreter?data=%s',
+                                                overpass_query))
+print(Sys.time())
+overpass_get <- GET(overpass_url_passed)
+        
+print(Sys.time())
+overpass_char <- rawToChar(overpass_get$content)
+        
+
+overpassa_final <- jsonlite::fromJSON(overpass_char, 
+                                      flatten = TRUE)
+
+
+overpassa_final$elements <- apply(data.frame(overpassa_final$elements),2,as.character)
+
+write.csv(data.frame(overpassa_final$elements),
+          'overpass_amazon_query.csv')
+```
+
+
+```{r}
+library(foreach)
+library(dplyr)
+library(doFuture)
+overpass_amazon_query <- read.csv('overpass_amazon_query.csv',
+                                  row.names = 'X')
+
+amazon_offices <- dplyr::filter(overpass_amazon_query,#tags.building.levels
+                                 !is.na(tags.name),
+                                is.na(tags.place),
+                                 !grepl('@|street|turnpike|highway|aven|boule|road|bike|counter|recruit|juice|crocker|herb|court|lane|(ia|ic|as|ite)([[:space:]]|$)|mine|ave|pool|commun|pharm|dental|constru',
+                                        tags.name, ignore.case = TRUE),
+                                 grepl('amazon',tags.name, ignore.case = TRUE),
+                                 grepl('\\.com|project|HQ|office|robot|customer',tags.name, ignore.case = TRUE),
+                                 (is.na(tags.operator)|grepl('amazon',
+                                                             tags.operator,
+                                                             ignore.case = TRUE)
+                                  ),
+                                 (is.na(tags.telecom)|tags.telecom!='data_center')
+                                 )
+amazon_logistics <- dplyr::filter(overpass_amazon_query,#tags.building.levels
+                                 !is.na(tags.name),
+                                 is.na(tags.place),
+                                 !grepl('@|street|turnpike|highway|aven|boule|road|bike|counter|recruit|juice|crocker|herb|court|lane|(ia|ic|as|ite)([[:space:]]|$)|mine|ave|pool|commun|pharm|dental|constru',
+                                        tags.name, ignore.case = TRUE),
+                                 grepl('amazon',tags.name, ignore.case = TRUE),
+                                 !grepl('\\.com|project|HQ|office|robot|web|customer',tags.name, ignore.case = TRUE),
+                                 (is.na(tags.operator)|grepl('amazon',
+                                                             tags.operator,
+                                                             ignore.case = TRUE)
+                                  ),
+                                 (is.na(tags.telecom)|tags.telecom!='data_center')
+                                 )
+amazon_data_centers <- dplyr::filter(overpass_amazon_query,#tags.building.levels
+                                 !is.na(tags.name),
+                                 is.na(tags.place),
+                                 !grepl('@|street|turnpike|highway|aven|boule|road|bike|counter|recruit|juice|crocker|herb|court|lane|(ia|ic|as|ite)([[:space:]]|$)|mine|ave|pool|commun|pharm|dental|constru',
+                                        tags.name, ignore.case = TRUE),
+                                 grepl('amazon',tags.name, ignore.case = TRUE),
+                                 !grepl('\\.com|project|HQ|office|robot|customer',tags.name, ignore.case = TRUE),
+                                 (is.na(tags.operator)|grepl('amazon',
+                                                             tags.operator,
+                                                             ignore.case = TRUE)
+                                  ),
+                                 tags.telecom=='data_center'
+                                 )
+dropped_cols <- names(which(apply(amazon_logistics,
+                                   2, 
+                                   function(x){length(
+                                     which(!is.na(x)
+                                           )
+                                     )}
+                                   )<50))
+if(length(dropped_cols)>0){
+  amazon_offices[,dropped_cols] <- NULL
+  amazon_logistics[,dropped_cols] <- NULL
+  amazon_data_centers[,dropped_cols] <- NULL
+  # overpass_amazon_query[,dropped_cols] <- NULL
+  
+}
+
+
+```
+
+
+```{r}
+get_way_coords = function(node_string){
+  node_ids = strsplit(gsub('c\\(|\\)',
+                              '',
+                            node_string),
+                       split = ',[[:space:]]?|:')[[1]]
+  
+  data_used <- dplyr::filter(overpass_amazon_query,
+                             id %in% node_ids)
+  return(data_used[,c('lat','lon')
+                   ]
+         )
+}
+get_relation_coords = function(members){
+  member_string = regmatches(members,
+             regexpr("(?<=ref = ).*(?=, role)",
+                     members, 
+                     perl = TRUE)
+             )
+  
+  way_ids = strsplit(gsub('c\\(|\\)',
+                              '',
+                            member_string),
+                       split = ',[[:space:]]?|:')[[1]]
+  
+  node_coords <- foreach(way = way_ids,
+                         .combine = 'rbind') %do% {
+                           data_used <- dplyr::filter(overpass_amazon_query,
+                                                      id ==way
+                                                      )
+                           get_way_coords(data_used$nodes)
+                         }
+  node_coords
+}
+
+na_handle = function(value){
+  ifelse(is.na(value),
+         NA,
+         value)
+}
+
+place_coord_df = function(df = amazon_logistics){
+  returned_coord_df <-foreach(index =1:nrow(df),
+        .combine = 'rbind') %do% {
+          if(df$type[index]=='node'){
+            return(data.frame(name = na_handle(df$tags.name[index]),
+                              lat = na_handle(df$lat[index]),
+                              long = na_handle(df$lon[index]),
+                              operator = na_handle(df$tags.operator[index]),
+                              add_houseNum = na_handle(df$tags.addr.housenumber[index]),
+                              add_street = na_handle(df$tags.addr.street[index]),
+                              add_city= na_handle(df$tags.addr.city[index]),
+                              add_zipCode=na_handle(df$tags.addr.postcode[index]),
+                              add_state = na_handle(df$tags.addr.state[index]),
+                              timestamp = na_handle(df$timestamp[index])
+                              )
+                   )
+          }
+          if(df$type[index]=='way'){
+            node_string = df$nodes[index]
+            node_coords_used <- get_way_coords(node_string)
+            return(data.frame(name = df$tags.name[index],
+                              lat = mean(node_coords_used[,'lat'],na.rm=TRUE),
+                              long = mean(node_coords_used[,'lon'],na.rm=TRUE),
+                              operator = df$tags.operator[index],
+                              add_houseNum = df$tags.addr.housenumber[index] ,
+                              add_street = df$tags.addr.street[index],
+                              add_city= df$tags.addr.city[index],
+                              add_zipCode=df$tags.addr.postcode[index],
+                              add_state = df$tags.addr.state[index],
+                              timestamp = na_handle(df$timestamp[index])
+                              ))
+            
+            
+            
+          }
+          if(amazon_logistics$type[index]=='relation'){
+           
+            member_string = df$members[index]
+            node_coords_used = get_relation_coords(member_string)
+            return(data.frame(name = df$tags.name[index],
+                              lat = mean(node_coords_used[,'lat'],na.rm=TRUE),
+                              long = mean(node_coords_used[,'lon'],na.rm=TRUE),
+                              operator = df$tags.operator[index],
+                              add_houseNum = df$tags.addr.housenumber[index] ,
+                              add_street = df$tags.addr.street[index],
+                              add_city= df$tags.addr.city[index],
+                              add_zipCode=df$tags.addr.postcode[index],
+                              add_state = df$tags.addr.state[index],
+                              timestamp = na_handle(df$timestamp[index])
+                              )
+                   )
+            
+            
+          }
+         
+         
+        }
+  return(returned_coord_df)
+
+}
+
+
+
+
+amazon_logistics_coords <- place_coord_df(amazon_logistics)
+
+amazon_office_coords <- place_coord_df(amazon_offices)
+
+amazon_data_center_coords <- place_coord_df(amazon_data_centers)
+
+write.csv(amazon_office_coords,
+          'amazon_offices_coords.csv')
+write.csv(amazon_logistics_coords,
+          'amazon_logistics_coords.csv')
+write.csv(amazon_data_center_coords,
+          'amazon_data_center_coords.csv')
+
+```
+
+#curl 'https://maps.googleapis.com/maps/api/geocode/xml?address=1600+Amphitheatre+Parkway,+Mountain+View,+CA&key=YOUR_API_KEY'
+#https://maps.googleapis.com/maps/api/geocode/json?latlng=40.714224,-73.961452&key=YOUR_API_KEY
+```{r}
+amazon_logistics_coords <- read.csv('amazon_logistics_coords.csv',
+                                         row.names = 'X')
+
+```
+
+```{r}
+fields_used = paste(c('places.displayName',
+                      'places.formattedAddress',
+                      'places.shortFormattedAddress',
+                      # 'places.editorialSummary',
+                      'places.id',
+                      'places.location',
+                      'places.businessStatus',
+                      'places.primaryType',
+                      'places.types'
+                      ),
+                    collapse = ',')
+misc_text <-readLines('misc.txt')
+# df <- nearbySearch(amazon_logistics_coords$lat[2], amazon_logistics_coords$long[2])
+nearbySearch = function(lat, long, text_query = 'amazon warehouse'){
+  low_lat_used = lat-0.075
+  low_long_used = long-0.075
+  high_lat_used = lat+0.075
+  high_long_used = long+0.075
+  placeAPI_request <-httr::POST(url = 'https://places.googleapis.com/v1/places:searchText',
+           body = list(
+                       textQuery = text_query,
+                       rankPreference = 'RELEVANCE',
+                       locationRestriction = list(rectangle = list(low =list(latitude = low_lat_used,
+                                                                             longitude = low_long_used
+                                                                             ),
+                                                                   high =list(latitude = high_lat_used,
+                                                                             longitude = high_long_used
+                                                                             )
+                                                                   )
+                                                  ),
+                       includedType = 'storage'
+                       ),
+           httr::add_headers(.headers = c('X-Goog-Api-Key' =misc_text[2],
+                                          'X-Goog-FieldMask' = fields_used,
+                                          'Content-Type' ='application/json'
+                                          )
+                             ),
+           encode = 'json'
+           )
+  jsonlite::fromJSON(rawToChar(placeAPI_request$content))[[1]]
+}
+
+buildingArea_calc = function(outlineCoordDf){
+  sfData_used <- st_as_sf(outlineCoordDf,
+                          coords = c('lat','long'),
+                          crs = 4326  )
+  sfPolygon_used <- sf::st_convex_hull(sf::st_union(sfData_used
+                                                    )
+                                       )
+  area_m2 <- st_area(sfPolygon_used)
+  trimws(gsub('\\[m^2\\]','',area_m2))
+}
+
+buildingOutlineSearch = function(placeID){
+  outlineRequest <- httr::GET(sprintf('https://maps.googleapis.com/maps/api/geocode/json?place_id=%s&extra_computations=BUILDING_AND_ENTRANCES&key=%s',
+                    placeID,
+                    misc_text[2]))
+  
+  outlineDF <- jsonlite::fromJSON(rawToChar(outlineRequest$content))[[1]]
+  if(is.null(outlineDF$building)){
+    return(data.frame(buildingArea_squaredMeter = NA,
+                    building_num = NA,
+                    entrance_num = NA
+                    ))
+  }
+  # print(outlineDF)
+  building_area_ests <- lapply(outlineDF$buildings[[1]]$building_outlines[[1]],
+                                    function(outline){
+                                     
+           buildingCoordDf = data.frame(lat = outline$coordinates[[1]][,,2], 
+                               long = outline$coordinates[[1]][,,1])
+           building_area_estimate = buildingArea_calc(buildingCoordDf)
+           return(as.numeric(building_area_estimate))
+         })
+  # print(sum(unlist(building_area_ests)))
+  # print(nrow(outlineDF$buildings[[1]]$building_outlines[[1]]))
+  # print( nrow(outlineDF$entrances[[1]]))
+  return(data.frame(buildingArea_squaredMeter = ifelse(is.null(sum(unlist(building_area_ests))),
+                                                       NA,
+                                                       sum(unlist(building_area_ests))) ,
+                    building_num = ifelse(is.null(nrow(outlineDF$buildings[[1]]$building_outlines[[1]])),
+                                          NA,
+                                          nrow(outlineDF$buildings[[1]]$building_outlines[[1]])
+                                          ),
+                    entrance_num = ifelse(is.null(nrow(outlineDF$entrances[[1]])),
+                                          NA,
+                                           nrow(outlineDF$entrances[[1]]))
+                    )
+         )
+}
+
+
+insist_nearbySearch= purrr:::insistently(nearbySearch,
+                                         rate = purrr::rate_backoff(pause_base = 2,
+                                                            pause_cap = 64,
+                                                            pause_min = 1,
+                                                            max_times = 5,
+                                                            jitter = TRUE
+                                                            ))
+
+insist_buildingOutlineSearch = purrr:::insistently(buildingOutlineSearch,
+                                        rate = purrr::rate_backoff(pause_base = 2,
+                                                            pause_cap = 64,
+                                                            pause_min = 1,
+                                                            max_times = 5,
+                                                            jitter = TRUE
+                                                            ))
+```
+
+# addresses <- reverse_geocode(df[start_ind:end_ind,],
+              #                              lat = 'lat',
+              #                              long = 'long',
+              #                              full_results = TRUE,
+              #                              method = 'google',
+              #                              return_coords = FALSE,
+              #                              return_input = FALSE)
+              # addresses 
+              
+```{r}
+library(foreach)
+
+library(doFuture)
+
+
+reverse_geocode_addrs_df = function(df){
+  registerDoFuture()
+  plan(multisession)
+  owners_info_scraped_addrs <- foreach(index = 1:nrow(df),
+                                        .combine = 'rbind') %dopar% {
+                                          print(index)
+                                          placesFound =tryCatch({
+                                            insist_nearbySearch(df$lat[index],
+                                                       df$long[index])
+                                            },
+                                             error=function(cond){
+                                               cond}
+                                            ) 
+                                          # print('1')
+                                          if(is.null(placesFound)|
+                                             'error' %in% class(placesFound)){
+                                            return(rep(NA,11))
+                                          }
+                                          
+                                          placesFound$location <- apply(placesFound$location,
+                                                                        1,
+                                                                        function(x){paste(x, 
+                                                                                          collapse = ',')})
+                                          placesFound$displayName <- placesFound$displayName$text
+                                          placesFound$types <- sapply(placesFound$types,
+                                                                      function(x){paste(x,
+                                                                                        collapse = ', ')})
+                                          # print('2')
+                                          # print(placesFound)
+                                          buildingInfo =  tryCatch({
+                                            data.frame(t(unlist(sapply(placesFound$id,
+                                                                insist_buildingOutlineSearch))
+                                                         )
+                                                       )
+                                            
+                                          },
+                                          error = function(cond){
+                                            cond
+                                          }) 
+                                          # print(buildingInfo)
+                                          if(is.null(buildingInfo)|
+                                             'error' %in% class(buildingInfo)){
+                                            return(rep(NA,11))
+                                          }
+                                          results <- data.frame(placesFound, 
+                                                           buildingInfo)
+                                          
+                                          print(dim(results))
+                                          results
+                                          }
+  owners_info_scraped_addrs
+}
+
+```
+# 
+```{r,warning=FALSE}
+# reverse_geocode(amazon_office_coords[1:5,],lat = 'lat',
+#                 long = 'long',
+#                 method = 'google',
+#                 full_results = TRUE)
+#71,76,77,82
+amazon_logistics_coords_addr <- reverse_geocode_addrs_df(amazon_logistics_coords)
+# amazon_office_coords_addr <- reverse_geocode_addrs_df(amazon_office_coords)
+# amazon_data_center_coords_addr <- reverse_geocode_addrs_df(amazon_data_center_coords)
+```
+
+
+```{r}
+
+amazon_logistics_coords_addr$buildingArea_squaredMeter <- unlist(amazon_logistics_coords_addr$buildingArea_squaredMeter)
+
+amazon_logistics_coords_addr$building_num <- unlist(amazon_logistics_coords_addr$building_num)
+
+
+amazon_logistics_coords_addr$entrance_num <- unlist(amazon_logistics_coords_addr$entrance_num)
+
+write.csv(amazon_logistics_coords_addr,
+          'amazon_logistics_coords_addr.csv')
+# write.csv(amazon_office_coords_addr,
+#           'amazon_office_coords_addr.csv')
+# write.csv(amazon_data_center_coords_addr,
+#           'amazon_data_center_coords_addr.csv')
+
+
+```
+# https://warehouse.ninja/locations/amazon/fwa6/
+```
+
+
+```{r}
+
+
+#https://overpass-api.de/api/interpreter?data=
+base_url <- 'https://www.mwpvl.com'
+
+mwpvl_img_download = function(base=base_url,
+                              title,
+                              folder,
+                              name){
+  link_used <- gsub('\\.{2}', base,
+                    s(sprintf('img[title="%s"]',
+                              title)) %>%
+                      elem_attr('src'))
+  download.file(link_used,
+                sprintf('%s/%s.png', folder, name),
+                mode = 'wb')
+}
+
+
+mwpvl_pdf_gen = function(folder){
+  files <- list.files(folder)
+  imgs <- files[grepl('png',files)]
+  
+  result<- sapply(paste(sprintf('%s/',
+                       folder),
+               imgs,
+               sep = ''),
+         function(path_used){
+           
+           
+           image_used <- magick::image_read(path_used) %>%
+                         image_crop(geometry = '+0%+40%') %>%
+                         image_scale(geometry = '120%x120%x') %>%
+                         image_convert(format = 'png',
+                                        type = 'Grayscale',
+                                        colorspace = 'LinearGray') 
+           
+           magick::image_write(image = image_used,
+                               path = gsub('png',
+                                           'pdf',
+                                           path_used) ,
+                               format = 'pdf')
+       })
+}
+
+mwpvl_table_extract_tabula =  function(folder){
+  files = list.files(folder)
+  pdfs = files[grepl('pdf',files)]
+  pdf_paths = paste(sprintf('%s/',
+                       folder),
+               pdfs,
+               sep = '')
+  result <- sapply(pdf_paths,
+         function(pdf){
+           
+           table_extract <- tabulapdf::extract_tables(pdf,
+                                                      output = 'matrix')
+           write.csv(table_extract,gsub('pdf',
+                                        'csv',
+                                        pdf)
+                            )
+         })
+}
+
+mwpvl_table_extract_tesseract =  function(folder, 
+                                          suffix = 'jpg'){
+  files = list.files(folder)
+  images = files[grepl(suffix,files)]
+  image_paths = paste(sprintf('%s/',
+                       folder),
+               images,
+               sep = '')
+  result <- sapply(image_paths,
+         function(path){
+           image <- magick::image_read(path)
+           table_extract <- tesseract::ocr(image)
+           table_extract
+           # write.csv(table_extract,gsub('jpg',
+           #                              'csv',
+           #                              pdf)
+                            # )
+         })
+}
+
+mwpvl_table_extract_tesseract('real_estate_pics')
+
+
+```
+
+
+
+```{r}
+session <- selenider_session(session = "selenium",
+                             browser = 'chrome',
+                  # options = chromote_options(headless = FALSE),
+                  driver = list(selenium_server(version = '4.29.0',
+                                                  interactive = FALSE,
+                                                  path = getwd(), temp = TRUE),
+                                SeleniumSession$new(browser = 'chrome',
+                    capabilities = selenium::chrome_options(args=c('--headless',
+                  '--no-sandbox',
+                  '--disable-extensions',
+                  '--disable-browser-side-navigation',
+                  '--disable-dev-shm-usage',
+                  "--disable-gpu",
+                  "--proxy-server='direct://'",
+                  '--proxy-bypass-list=*')),
+                    timeout = 60))
+                  ,
+                  timeout = 60)
+
+
+open_url("https://www.mwpvl.com/html/amazon_com.html")
+mwpvl_img_download(title ='Amazon Sortation Center Network in USA',
+                   folder = 'amazon',
+                   name = 'sortCenter')
+mwpvl_img_download(title ='Amazon Fulfillment Center Network in USA',
+                   folder = 'amazon',
+                   name = 'fulfillCenter')
+mwpvl_img_download(title ='Amazon Food Distribution Center Network in USA',
+                   folder = 'amazon',
+                   name = 'foodDistCenter')
+mwpvl_img_download(title ='Amazon Whole Foods Retail Grocery Distribution Center Network in USA',
+                   folder = 'amazon',
+                   name = 'grocDistCenter')
+
+mwpvl_img_download(title ='Amazon Prime Now Network in USA',
+                   folder = 'amazon',
+                   name = 'primeNowCenter')
+
+mwpvl_img_download(title ='Amazon Inbound Crossdock Network in USA',
+                   folder = 'amazon',
+                   name = 'ixdCenter')
+
+mwpvl_img_download(title ='Amazon Air Hub Network in USA',
+                   folder = 'amazon',
+                   name = 'airHubCenter')
+
+mwpvl_img_download(title ='Amazon Delivery Station Network in USA Part 1',
+                   folder = 'amazon',
+                   name = 'deliveryStation1')
+mwpvl_img_download(title ='Amazon Delivery Station Network in USA Part 2',
+                   folder = 'amazon',
+                   name = 'deliveryStation2')
+
+mwpvl_img_download(title ='Amazon Heavy Bulky Delivery Station Network in USA',
+                   folder = 'amazon',
+                   name = 'heavyBulk')
+
+mwpvl_img_download(title ='Amazon Fulfillment Center Network in Rest of World',
+                   folder = 'amazon',
+                   name = 'internatFulFill')
+
+mwpvl_img_download(title ='Amazon ROW Network Part 1',
+                   folder = 'amazon',
+                   name = 'rowNetwork1')
+mwpvl_img_download(title ='Amazon ROW Network Part 2',
+                   folder = 'amazon',
+                   name = 'rowNetwork2')
+mwpvl_img_download(title ='Amazon Distribution Center Summary Table',
+                   folder = 'amazon',
+                   name = 'distCenterSumm')
+
+
+mwpvl_pdf_gen('amazon')
+mwpvl_table_extract('amazon')
+
+airHubCenter_table <- tesseract::ocr("amazon/airHubCenter.png")
+
+
+
+```
+
+```{r}
+library(readr)
+library(rvest)
+library(selenider)
+library(dplyr)
+library(selenium)
+# library(chromote)
+
+library(readr)
+# user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.50 Safari/537.36'
+
+#Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36
+
+
+library(future)
+library(foreach)
+
+session <- selenider_session(session = "selenium",
+                             browser = 'chrome',
+                  # options = chromote_options(headless = FALSE),
+                  driver = list(selenium_server(version = '4.29.0',
+                                                  interactive = FALSE,
+                                                  path = getwd(), temp = TRUE),
+                                SeleniumSession$new(browser = 'chrome',
+                    capabilities = selenium::chrome_options(args=c('--headless',
+                  '--no-sandbox',
+                  '--disable-extensions',
+                  '--disable-browser-side-navigation',
+                  '--disable-dev-shm-usage',
+                  "--disable-gpu",
+                  "--proxy-server='direct://'",
+                  '--proxy-bypass-list=*')),
+                    timeout = 60))
+                  ,
+                  timeout = 60)
+
+base_url <- 'https://www.mwpvl.com'
+
+
+
+open_url("https://www.mwpvl.com/html/walmart.html")
+mwpvl_img_download(title ='Walmart Distribution Network Summary',
+                   folder = 'walmart',
+                   name = 'distCenterSumm')
+mwpvl_img_download(title ='Walmart U.S.A. Regional Distribution Centers',
+                   folder = 'walmart',
+                   name = 'regionalDistCenter')
+
+mwpvl_img_download(title ='Walmart U.S.A. Food Distribution Centers',
+                   folder = 'walmart',
+                   name = 'foodDistCenter')
+mwpvl_img_download(title ='Walmart U.S.A. E-Commerce Fulfillment Centers',
+                   folder = 'walmart',
+                   name = 'eCommFulfillDistCenter')
+mwpvl_img_download(title ="Walmart U.S.A. Sam's Club E-Commerce Dark Stores",
+                   folder = 'walmart',
+                   name = 'eCommDarkStore')
+
+mwpvl_img_download(title ='Walmart U.S.A. Fashion Distribution Centers',
+                   folder = 'walmart',
+                   name = 'fashDistCenter')
+mwpvl_img_download(title ='Walmart U.S.A. Specialty Distribution Centers',
+                   folder = 'walmart',
+                   name = 'specDistCenter')
+mwpvl_img_download(title ='Walmart U.S.A. Import Distribution Centers',
+                   folder = 'walmart',
+                   name = 'importDistCenter')
+mwpvl_img_download(title ='Walmart U.S.A. Centerpoint Crossdock Facilities',
+                   folder = 'walmart',
+                   name = 'centXD')
+mwpvl_img_download(title ="Walmart U.S.A. Sam's Club Crossdock Facilities",
+                   folder = 'walmart',
+                   name = 'samClubXD')
+mwpvl_img_download(title ='Walmart U.S.A. Manufacturing Facilities',
+                   folder = 'walmart',
+                   name = 'manuFacilities')
+
+mwpvl_img_download(title ='Walmart U.S.A. Closed Facilities',
+                   folder = 'walmart',
+                   name = 'closedFacilities')
+
+
+
+mwpvl_pdf_gen('walmart')
+
+```
+
+
+
+```{r}
+library(readr)
+library(rvest)
+library(selenider)
+library(dplyr)
+library(selenium)
+# library(chromote)
+
+library(readr)
+# user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.50 Safari/537.36'
+
+#Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36
+
+
+library(future)
+library(foreach)
+
+session <- selenider_session(session = "selenium",
+                             browser = 'chrome',
+                  # options = chromote_options(headless = FALSE),
+                  driver = list(selenium_server(version = '4.29.0',
+                                                  interactive = FALSE,
+                                                  path = getwd(), temp = TRUE),
+                                SeleniumSession$new(browser = 'chrome',
+                    capabilities = selenium::chrome_options(args=c('--headless',
+                  '--no-sandbox',
+                  '--disable-extensions',
+                  '--disable-browser-side-navigation',
+                  '--disable-dev-shm-usage',
+                  "--disable-gpu",
+                  "--proxy-server='direct://'",
+                  '--proxy-bypass-list=*')),
+                    timeout = 60))
+                  ,
+                  timeout = 60)
+
+base_url <- 'https://www.mwpvl.com'
+
+open_url('https://www.mwpvl.com/html/john_deere.html')
+
+partsDistTable <- s('#Table38') %>% 
+  elem_text()
+
+internpartsDistTable <- s('#Table39') %>% 
+  elem_attr(name = 'tr')
+
+readr::write_rds(partsDistTable,
+                 'john deere/partsDistTable.rds'
+                 )
+readr::write_rds(internpartsDistTable,
+                 'john deere/internpartsDistTable.rds'
+                 )
+
+##Table39
+```
+
+
+```{r}
+
+#
+library(readr)
+library(rvest)
+library(selenider)
+library(dplyr)
+library(selenium)
+# library(chromote)
+
+library(readr)
+# user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.50 Safari/537.36'
+
+#Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36
+
+
+library(future)
+library(foreach)
+
+session <- selenider_session(session = "selenium",
+                             browser = 'chrome',
+                  # options = chromote_options(headless = FALSE),
+                  driver = list(selenium_server(version = '4.29.0',
+                                                  interactive = FALSE,
+                                                  path = getwd(), temp = TRUE),
+                                SeleniumSession$new(browser = 'chrome',
+                    capabilities = selenium::chrome_options(args=c('--headless',
+                  '--no-sandbox',
+                  '--disable-extensions',
+                  '--disable-browser-side-navigation',
+                  '--disable-dev-shm-usage',
+                  "--disable-gpu",
+                  "--proxy-server='direct://'",
+                  '--proxy-bypass-list=*')),
+                    timeout = 60))
+                  ,
+                  timeout = 60)
+
+base_url <- 'https://www.mwpvl.com'
+
+
+
+open_url("https://www.mwpvl.com/html/target.html")
+mwpvl_img_download(title ='Target Distribution Network Summary',
+                   folder = 'target',
+                   name = 'distCenterSumm')
+
+mwpvl_img_download(title ='Target Distribution Network Summary',
+                   folder = 'target',
+                   name = 'distCenterSumm')
+mwpvl_img_download(title ='Target Regional Distribution Centers',
+                   folder = 'target',
+                   name = 'regionalDistCenter')
+mwpvl_img_download(title ='Target Food Distribution Centers',
+                   folder = 'target',
+                   name = 'foodDistCenter')
+mwpvl_img_download(title ='Target E-Commerce Distribution Centers',
+                   folder = 'target',
+                   name = 'eCommDistCenter')
+mwpvl_img_download(title ='Target Import Distribution Centers',
+                   folder = 'target',
+                   name = 'importDistCenter')
+mwpvl_img_download(title ='Target Specialty Distribution Centers',
+                   folder = 'target',
+                   name = 'specDistCenter')
+#
+mwpvl_img_download(title ='Target Closed Distribution Centers',
+                   folder = 'target',
+                   name = 'closedDistCenter')
+mwpvl_pdf_gen('target')
+
+```
